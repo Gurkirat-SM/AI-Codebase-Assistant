@@ -17,59 +17,16 @@ class Settings(BaseSettings):
     # Scanner configuration
     MAX_FILE_SIZE_BYTES: int = 1_048_576  # 1 MB default limit
     SCANNER_IGNORE_DIRS: List[str] = [
-        ".git",
-        ".venv",
-        "venv",
-        "ENV",
-        "node_modules",
-        "__pycache__",
-        ".pytest_cache",
-        ".idea",
-        ".vscode",
-        "dist",
-        "build",
-        "target",
-        "bin",
-        "obj",
-        ".next",
-        "coverage",
-        ".mypy_cache",
-        ".ruff_cache",
+        ".git", ".venv", "venv", "ENV", "node_modules", "__pycache__",
+        ".pytest_cache", ".idea", ".vscode", "dist", "build", "target",
+        "bin", "obj", ".next", "coverage", ".mypy_cache", ".ruff_cache",
     ]
     SCANNER_IGNORE_FILE_PATTERNS: List[str] = [
-        "*.pyc",
-        "*.pyo",
-        "*.pyd",
-        "*.so",
-        "*.dll",
-        "*.exe",
-        "*.dylib",
-        "*.class",
-        "*.jar",
-        "*.war",
-        "*.zip",
-        "*.tar",
-        "*.gz",
-        "*.rar",
-        "*.7z",
-        "*.png",
-        "*.jpg",
-        "*.jpeg",
-        "*.gif",
-        "*.ico",
-        "*.svg",
-        "*.webp",
-        "*.pdf",
-        "*.woff",
-        "*.woff2",
-        "*.ttf",
-        "*.eot",
-        "*.mp4",
-        "*.mp3",
-        "*.wav",
-        "*.lock",
-        "package-lock.json",
-        "pnpm-lock.yaml",
+        "*.pyc", "*.pyo", "*.pyd", "*.so", "*.dll", "*.exe", "*.dylib",
+        "*.class", "*.jar", "*.war", "*.zip", "*.tar", "*.gz", "*.rar",
+        "*.7z", "*.png", "*.jpg", "*.jpeg", "*.gif", "*.ico", "*.svg",
+        "*.webp", "*.pdf", "*.woff", "*.woff2", "*.ttf", "*.eot", "*.mp4",
+        "*.mp3", "*.wav", "*.lock", "package-lock.json", "pnpm-lock.yaml",
         "yarn.lock",
     ]
 
@@ -85,7 +42,7 @@ class Settings(BaseSettings):
 
     # Gemini LLM configuration
     GEMINI_API_KEY: Optional[str] = None
-    GEMINI_MODEL: str = "gemini-2.5-flash"
+    GEMINI_MODEL: str = "gemini-3.8-flash"
 
     # CORS configuration
     CORS_ORIGINS: List[str] = ["*"]
@@ -101,4 +58,3 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Return cached instance of application settings."""
     return Settings()
-
