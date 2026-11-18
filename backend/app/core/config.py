@@ -33,12 +33,31 @@ class Settings(BaseSettings):
     # Chunker configuration
     CHUNK_SIZE_LINES: int = 60
     CHUNK_OVERLAP_LINES: int = 15
+    ENABLE_CODE_AWARE_CHUNKING: bool = True
+    MAX_CODE_CHUNK_LINES: int = 120
 
     # RAG / Embedding configuration
     EMBEDDING_MODEL_NAME: str = "sentence-transformers/all-MiniLM-L6-v2"
     INDEX_STORAGE_DIR: str = ".index"
     DEFAULT_TOP_K: int = 5
     EMBEDDING_BATCH_SIZE: int = 32
+
+    # Hybrid Search configuration
+    ENABLE_HYBRID_SEARCH: bool = True
+    BM25_WEIGHT: float = 0.5
+    VECTOR_WEIGHT: float = 0.5
+    RRF_K: int = 60
+
+    # Intelligent Retrieval Weighting
+    ENABLE_FILE_TYPE_WEIGHTING: bool = True
+
+    # Reranker configuration
+    ENABLE_RERANKER: bool = True
+    RERANKER_MODEL_NAME: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    RERANKER_TOP_N_CANDIDATES: int = 20
+
+    # Generation & Context Budget
+    MAX_CONTEXT_CHARS: int = 24_000
 
     # Gemini LLM configuration
     GEMINI_API_KEY: Optional[str] = None

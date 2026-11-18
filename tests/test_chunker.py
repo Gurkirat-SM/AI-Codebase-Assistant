@@ -99,3 +99,93 @@ def test_chunk_file_method(tmp_path: Path):
     assert chunks[0].start_line == 1
     assert chunks[0].end_line == 20
 
+
+def test_code_aware_python_function_preservation():
+    """Verify that complete Python functions are preserved without arbitrary mid-function cuts."""
+    code = (
+        "import os\n"
+        "\n"
+        "@decorator\n"
+        "def compute_total(a: int, b: int) -> int:\n"
+        "    # Line 1 of body\n"
+        "    temp = a * 2\n"
+        "    temp += b * 3\n"
+        "    return temp\n"
+        "\n"
+        "def secondary_helper(x: int) -> int:\n"
+        "    return x + 1\n"
+    )
+    chunker = CodeChunker(chunk_size_lines=15, chunk_overlap_lines=3, enable_code_aware=True)
+    chunks = chunker.chunk_text(code, file_path="math_utils.py", language="Python")
+
+    assert len(chunks) >= 1
+    # Check that decorator and entire function body are kept together in a chunk
+    found = False
+    for c in chunks:
+        if "compute_total" in c.content:
+            found = True
+            assert "@decorator" in c.content
+            assert "return temp" in c.content
+            # Check line correspondence
+            expected = "".join(code.splitlines(keepends=True)[c.start_line - 1 : c.end_line])
+            assert c.content == expected
+    assert found
+
+
+def test_code_aware_class_splitting_and_context():
+    """Verify that large classes are split at method boundaries and keep method integrity."""
+    class_code = (
+        "class DataRepository:\n"
+        "    '''Main data access repository.'''\n"
+        "    DB_NAME = 'production'\n"
+        "\n"
+        "    def __init__(self, connection_string: str):\n"
+        "        self.conn = connection_string\n"
+        "        self.is_connected = False\n"
+        "\n"
+        "    def connect(self) -> bool:\n"
+        "        self.is_connected = True\n"
+        "        return True\n"
+        "\n"
+        "    def query_records(self, sql: str) -> list:\n"
+        "        if not self.is_connected:\n"
+        "            raise RuntimeError('Not connected')\n"
+        "        return [1, 2, 3]\n"
+    )
+    # Small chunk_size_lines forces splitting of the class into methods
+    chunker = CodeChunker(chunk_size_lines=8, chunk_overlap_lines=2, enable_code_aware=True)
+    chunks = chunker.chunk_text(class_code, file_path="repo.py", language="Python")
+
+    assert len(chunks) >= 2
+    # Verify exact line slices for all chunks
+    lines = class_code.splitlines(keepends=True)
+    for c in chunks:
+        expected = "".join(lines[c.start_line - 1 : c.end_line])
+        assert c.content == expected
+        assert c.line_count == len(lines[c.start_line - 1 : c.end_line])
+
+    # Method boundaries must not be split
+    query_chunk = next(c for c in chunks if "query_records" in c.content)
+    assert "def query_records" in query_chunk.content
+    assert "return [1, 2, 3]" in query_chunk.content
+
+
+def test_code_aware_syntax_error_fallback():
+    """Verify that Python files with syntax errors gracefully fall back to sliding window."""
+    malformed_code = (
+        "def broken(\n"
+        "    this is invalid python syntax !!!\n"
+        "    for x in:\n"
+        "        pass\n"
+        "return 42\n"
+    )
+    chunker = CodeChunker(chunk_size_lines=3, chunk_overlap_lines=1, enable_code_aware=True)
+    chunks = chunker.chunk_text(malformed_code, file_path="broken.py", language="Python")
+
+    assert len(chunks) >= 2
+    lines = malformed_code.splitlines(keepends=True)
+    for c in chunks:
+        expected = "".join(lines[c.start_line - 1 : c.end_line])
+        assert c.content == expected
+
+

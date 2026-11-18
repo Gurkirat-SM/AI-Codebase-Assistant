@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, status
 
@@ -173,12 +174,24 @@ def query_repository(request: QueryRequest) -> QueryResponse:
             top_k=request.top_k,
             score_threshold=request.score_threshold,
             file_filter=request.file_filter,
+            enable_reranker=request.enable_reranker,
+            enable_hybrid=request.enable_hybrid,
         )
 
         chunks = [r.chunk for r in retrieval_response.results]
+        t_llm_start = time.perf_counter()
         answer = gemini_service.generate_answer(
             question=request.query,
             chunks=chunks,
+        )
+        t_llm_end = time.perf_counter()
+        llm_duration = round(t_llm_end - t_llm_start, 4)
+
+        if not hasattr(retrieval_response, "latencies") or retrieval_response.latencies is None:
+            retrieval_response.latencies = {}
+        retrieval_response.latencies["llm_generation_sec"] = llm_duration
+        retrieval_response.latencies["total_query_sec"] = round(
+            retrieval_response.latencies.get("total_retrieval_sec", 0.0) + llm_duration, 4
         )
 
         retrieval_response.answer = answer

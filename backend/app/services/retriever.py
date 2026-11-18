@@ -1,6 +1,7 @@
+import time
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from backend.app.core.config import get_settings
 from backend.app.models.schemas import (
@@ -11,38 +12,50 @@ from backend.app.models.schemas import (
     QueryResult,
     QuerySource,
 )
+from backend.app.services.bm25 import BM25Index
 from backend.app.services.chunker import CodeChunker
 from backend.app.services.embedder import CodeEmbedder, get_embedder
+from backend.app.services.hybrid import reciprocal_rank_fusion
+from backend.app.services.reranker import CodeReranker, get_reranker
 from backend.app.services.scanner import RepoScanner
 from backend.app.services.vector_store import FaissVectorStore
 
 
 class RagService:
-    """End-to-end RAG service orchestrating repository scanning, embedding, FAISS indexing, and retrieval."""
+    """Advanced RAG service orchestrating code-aware chunking, dense vector search,
+    BM25 keyword search, reciprocal rank fusion, and cross-encoder reranking.
+    """
 
     def __init__(
         self,
         embedder: Optional[CodeEmbedder] = None,
         vector_store: Optional[FaissVectorStore] = None,
         storage_dir: Optional[str | Path] = None,
+        bm25_index: Optional[BM25Index] = None,
+        reranker: Optional[CodeReranker] = None,
     ):
         settings = get_settings()
         self.storage_dir = Path(storage_dir or settings.INDEX_STORAGE_DIR).resolve()
         self.embedder = embedder or get_embedder()
         self.vector_store = vector_store
+        self.bm25_index = bm25_index if bm25_index is not None else BM25Index()
+        self.reranker = reranker if reranker is not None else get_reranker()
 
-        # Attempt to auto-load persisted index if vector store not pre-provided
+        # Attempt to auto-load persisted indexes if vector store not pre-provided
         if self.vector_store is None:
             self._init_vector_store()
 
     def _init_vector_store(self):
-        """Initialize FAISS vector store, attempting to load from disk if an index exists."""
+        """Initialize FAISS vector store and BM25 index, loading from disk if present."""
         self.vector_store = FaissVectorStore(dimension=self.embedder.dimension)
         if self.storage_dir.exists():
             try:
                 self.vector_store.load(self.storage_dir)
             except Exception:
-                # If loading fails, keep the clean empty vector store
+                pass
+            try:
+                self.bm25_index.load(self.storage_dir)
+            except Exception:
                 pass
 
     def index_repository(
@@ -53,7 +66,9 @@ class RagService:
         chunk_size_lines: Optional[int] = None,
         chunk_overlap_lines: Optional[int] = None,
     ) -> IndexResponse:
-        """Scan a repository, chunk code files, embed chunks, and build the FAISS index."""
+        """Scan a repository, chunk code files using code-aware chunking,
+        embed chunks, build FAISS vector index, and construct BM25 keyword index.
+        """
         target_path = Path(repo_path).resolve()
         if not target_path.exists():
             raise FileNotFoundError(f"Repository path does not exist: {target_path}")
@@ -67,7 +82,7 @@ class RagService:
         )
         scan_summary = scanner.scan()
 
-        # 2. Chunk discovered files
+        # 2. Chunk discovered files using code-aware chunker
         chunker = CodeChunker(
             chunk_size_lines=chunk_size_lines,
             chunk_overlap_lines=chunk_overlap_lines,
@@ -94,10 +109,10 @@ class RagService:
                 persisted=False,
             )
 
-        # 3. Generate embeddings
+        # 3. Generate dense vector embeddings
         embeddings = self.embedder.embed_chunks(all_chunks)
 
-        # 4. Populate FAISS index
+        # 4. Populate FAISS vector store
         self.vector_store = FaissVectorStore(dimension=self.embedder.dimension)
         self.vector_store.add_chunks(
             chunks=all_chunks,
@@ -106,10 +121,15 @@ class RagService:
             model_name=self.embedder.model_name,
         )
 
-        # 5. Optionally persist to disk
+        # 5. Populate BM25 keyword index
+        self.bm25_index = BM25Index()
+        self.bm25_index.add_chunks(all_chunks)
+
+        # 6. Optionally persist to disk
         persisted_path = None
         if persist:
             saved_dir = self.vector_store.save(self.storage_dir)
+            self.bm25_index.save(self.storage_dir)
             persisted_path = str(saved_dir)
 
         return IndexResponse(
@@ -130,18 +150,72 @@ class RagService:
         top_k: int = 5,
         score_threshold: Optional[float] = None,
         file_filter: Optional[str] = None,
+        enable_reranker: Optional[bool] = None,
+        enable_hybrid: Optional[bool] = None,
     ) -> QueryResponse:
-        """Perform semantic search against the indexed codebase chunks."""
+        """Perform code-aware hybrid search (dense vector + BM25 keyword)
+        with Reciprocal Rank Fusion, query-dependent weighting, and cross-encoder reranking.
+        """
         if self.vector_store is None or self.vector_store.total_chunks == 0:
             raise ValueError("No codebase has been indexed yet. Please index a repository first via /api/index.")
 
+        settings = get_settings()
+        use_hybrid = enable_hybrid if enable_hybrid is not None else settings.ENABLE_HYBRID_SEARCH
+        use_reranker = enable_reranker if enable_reranker is not None else settings.ENABLE_RERANKER
+
+        t_total_start = time.perf_counter()
+        latencies: Dict[str, float] = {}
+
+        candidate_k = max(top_k * 4, settings.RERANKER_TOP_N_CANDIDATES)
+
+        # 1. Vector Search
+        t_vec_start = time.perf_counter()
         query_vector = self.embedder.embed_query(query)
-        results: List[QueryResult] = self.vector_store.search(
+        vector_results: List[QueryResult] = self.vector_store.search(
             query_vector=query_vector,
-            top_k=top_k,
+            top_k=candidate_k,
             score_threshold=score_threshold,
             file_filter=file_filter,
         )
+        latencies["vector_retrieval_sec"] = round(time.perf_counter() - t_vec_start, 4)
+
+        # 2. BM25 Keyword Search
+        bm25_results = []
+        if use_hybrid and self.bm25_index.total_chunks > 0:
+            t_bm25_start = time.perf_counter()
+            bm25_results = self.bm25_index.search(
+                query=query,
+                top_k=candidate_k,
+                file_filter=file_filter,
+            )
+            latencies["bm25_retrieval_sec"] = round(time.perf_counter() - t_bm25_start, 4)
+
+        # 3. Hybrid Fusion via Reciprocal Rank Fusion (RRF) with file-type weighting
+        t_fusion_start = time.perf_counter()
+        if use_hybrid and bm25_results:
+            candidates = reciprocal_rank_fusion(
+                vector_results=vector_results,
+                bm25_results=bm25_results,
+                query=query,
+                top_k=candidate_k,
+            )
+        else:
+            candidates = vector_results
+        latencies["fusion_sec"] = round(time.perf_counter() - t_fusion_start, 4)
+
+        # 4. Cross-Encoder Reranking
+        t_rerank_start = time.perf_counter()
+        if use_reranker and self.reranker.is_available:
+            final_results = self.reranker.rerank(
+                query=query,
+                candidates=candidates,
+                top_k=top_k,
+            )
+        else:
+            final_results = candidates[:top_k]
+        latencies["reranking_sec"] = round(time.perf_counter() - t_rerank_start, 4)
+
+        latencies["total_retrieval_sec"] = round(time.perf_counter() - t_total_start, 4)
 
         sources = [
             QuerySource(
@@ -152,7 +226,7 @@ class RagService:
                 score=r.score,
                 language=r.chunk.language,
             )
-            for r in results
+            for r in final_results
         ]
 
         return QueryResponse(
@@ -160,11 +234,12 @@ class RagService:
             answer="",
             sources=sources,
             total_results=len(sources),
-            results=results,
+            results=final_results,
+            latencies=latencies,
         )
 
     def get_status(self) -> IndexStatusResponse:
-        """Return status and metadata of current FAISS index."""
+        """Return status and metadata of current FAISS and BM25 index."""
         is_indexed = self.vector_store is not None and self.vector_store.total_chunks > 0
         persisted_dir = str(self.storage_dir) if (self.storage_dir / "index.faiss").exists() else None
 
@@ -182,4 +257,3 @@ class RagService:
 def get_rag_service() -> RagService:
     """Return cached singleton instance of RagService."""
     return RagService()
-

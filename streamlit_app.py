@@ -90,9 +90,10 @@ with st.sidebar:
     st.markdown("**How it works**")
     st.markdown(
         "1. Upload a repository ZIP.\n"
-        "2. Scan and chunk source files.\n"
-        "3. Generate embeddings and build a FAISS index.\n"
-        "4. Ask questions; Gemini answers using retrieved code context."
+        "2. Code-aware chunking preserves functions & classes.\n"
+        "3. Hybrid search: FAISS vector + BM25 keyword matching.\n"
+        "4. Cross-encoder reranks most relevant code sections.\n"
+        "5. Gemini generates grounded answers citing file paths and lines."
     )
 
 for key, default in {
@@ -169,6 +170,9 @@ else:
             with st.spinner("Searching the codebase..."):
                 retrieval = st.session_state.rag_service.search(question, top_k=top_k)
             chunks = [item.chunk for item in retrieval.results]
+            if hasattr(retrieval, "latencies") and retrieval.latencies:
+                total_t = retrieval.latencies.get("total_retrieval_sec", 0.0)
+                st.caption(f"⚡ Hybrid retrieval & rerank: {total_t:.3f}s")
 
             st.markdown("### Answer")
             answer_area = st.empty()

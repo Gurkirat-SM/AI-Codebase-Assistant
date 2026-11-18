@@ -118,6 +118,14 @@ class QueryRequest(BaseModel):
         default=None,
         description="Optional substring filter for relative file paths",
     )
+    enable_reranker: Optional[bool] = Field(
+        default=None,
+        description="Optional flag to enable or disable cross-encoder reranker",
+    )
+    enable_hybrid: Optional[bool] = Field(
+        default=None,
+        description="Optional flag to enable or disable hybrid search",
+    )
 
 
 class QueryResponse(BaseModel):
@@ -127,6 +135,7 @@ class QueryResponse(BaseModel):
     sources: List[QuerySource] = Field(default_factory=list, description="Retrieved code sources")
     total_results: int = Field(default=0, description="Total sources retrieved")
     results: List[QueryResult] = Field(default_factory=list, description="Raw chunk results for backward compatibility")
+    latencies: Dict[str, float] = Field(default_factory=dict, description="Latency breakdown in seconds")
 
 
 class IndexRequest(BaseModel):
