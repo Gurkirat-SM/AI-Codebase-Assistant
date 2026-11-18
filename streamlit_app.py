@@ -15,11 +15,7 @@ import streamlit as st
 from backend.app.services.llm import GeminiService
 from backend.app.services.retriever import RagService
 
-st.set_page_config(
-    page_title="AI Codebase Assistant",
-    page_icon="🧠",
-    layout="wide",
-)
+st.set_page_config(page_title="AI Codebase Assistant", page_icon="🧠", layout="wide")
 
 MAX_ARCHIVE_BYTES = 200 * 1024 * 1024
 MAX_UNPACKED_BYTES = 500 * 1024 * 1024
@@ -30,7 +26,6 @@ def safe_extract_zip(archive_bytes: bytes, destination: Path) -> Path:
     """Extract a ZIP safely, rejecting traversal paths and oversized archives."""
     if len(archive_bytes) > MAX_ARCHIVE_BYTES:
         raise ValueError("The uploaded ZIP exceeds the 200 MB upload limit.")
-
     destination.mkdir(parents=True, exist_ok=True)
     total_unpacked = 0
     file_count = 0
@@ -40,29 +35,22 @@ def safe_extract_zip(archive_bytes: bytes, destination: Path) -> Path:
         members = archive.infolist()
         if len(members) > MAX_ARCHIVE_FILES:
             raise ValueError("The ZIP contains too many files.")
-
         for member in members:
             member_path = Path(member.filename)
             if member_path.is_absolute() or ".." in member_path.parts:
                 raise ValueError("The ZIP contains an unsafe file path.")
-
             target = (root / member_path).resolve()
             if target != root and root not in target.parents:
                 raise ValueError("The ZIP contains an unsafe file path.")
-
             total_unpacked += member.file_size
             if total_unpacked > MAX_UNPACKED_BYTES:
                 raise ValueError("The extracted archive would exceed the 500 MB limit.")
-
             if not member.is_dir():
                 file_count += 1
-
         archive.extractall(root)
 
     if file_count == 0:
         raise ValueError("The ZIP archive is empty.")
-
-    # If the archive contains one wrapper directory, index that directory.
     children = list(root.iterdir())
     if len(children) == 1 and children[0].is_dir():
         return children[0]
@@ -79,9 +67,7 @@ def get_api_key() -> str | None:
 
 
 def initialize_services(index_dir: Path, api_key: str | None) -> tuple[RagService, GeminiService]:
-    rag = RagService(storage_dir=index_dir)
-    gemini = GeminiService(api_key=api_key)
-    return rag, gemini
+    return RagService(storage_dir=index_dir), GeminiService(api_key=api_key)
 
 
 st.title("🧠 AI Codebase Assistant")
@@ -109,16 +95,15 @@ with st.sidebar:
         "4. Ask questions; Gemini answers using retrieved code context."
     )
 
-if "workspace" not in st.session_state:
-    st.session_state.workspace = None
-if "rag_service" not in st.session_state:
-    st.session_state.rag_service = None
-if "gemini_service" not in st.session_state:
-    st.session_state.gemini_service = None
-if "indexed" not in st.session_state:
-    st.session_state.indexed = False
-if "index_summary" not in st.session_state:
-    st.session_state.index_summary = None
+for key, default in {
+    "workspace": None,
+    "rag_service": None,
+    "gemini_service": None,
+    "indexed": False,
+    "index_summary": None,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 upload_col, action_col = st.columns([3, 1])
 with upload_col:
@@ -139,9 +124,7 @@ if index_clicked and uploaded_zip is not None:
             workspace = tempfile.TemporaryDirectory(prefix="codebase-assistant-")
             workspace_path = Path(workspace.name)
             repository_path = safe_extract_zip(uploaded_zip.getvalue(), workspace_path / "repository")
-            index_path = workspace_path / "faiss-index"
-
-            rag, gemini = initialize_services(index_path, api_key)
+            rag, gemini = initialize_services(workspace_path / "faiss-index", api_key)
             summary = rag.index_repository(repo_path=str(repository_path), persist=True)
 
             st.session_state.workspace = workspace
@@ -179,23 +162,29 @@ else:
         placeholder="Example: How does the repository scanner exclude binary files?",
         height=100,
     )
-    top_k = st.slider("Number of code sections to retrieve", min_value=1, max_value=10, value=5)
+    top_k = st.slider("Number of code sections to retrieve", min_value=1, max_value=8, value=3)
 
     if st.button("Ask question", type="primary", disabled=not question.strip()):
         try:
-            with st.spinner("Searching the codebase and generating an answer..."):
+            with st.spinner("Searching the codebase..."):
                 retrieval = st.session_state.rag_service.search(question, top_k=top_k)
-                chunks = [item.chunk for item in retrieval.results]
-                answer = st.session_state.gemini_service.generate_answer(question, chunks)
+            chunks = [item.chunk for item in retrieval.results]
 
             st.markdown("### Answer")
-            st.markdown(answer)
+            answer_area = st.empty()
+            with st.spinner("Gemini is generating an answer..."):
+                answer_area.write_stream(
+                    st.session_state.gemini_service.generate_answer_stream(question, chunks)
+                )
 
             st.markdown("### Retrieved source code")
             if not retrieval.sources:
                 st.warning("No relevant code sections were retrieved.")
             for number, source in enumerate(retrieval.sources, start=1):
-                heading = f"{number}. {source.file_path} · lines {source.start_line}–{source.end_line} · similarity {source.score:.3f}"
+                heading = (
+                    f"{number}. {source.file_path} · lines {source.start_line}–"
+                    f"{source.end_line} · similarity {source.score:.3f}"
+                )
                 with st.expander(heading):
                     st.caption(source.language)
                     st.code(source.snippet, language=None)
