@@ -33,12 +33,19 @@ CRITICAL INSTRUCTIONS:
    - **Reasonable Inferences:** Logical deductions that are not explicitly written in code (must be explicitly labeled as inferences).
 
 3. CROSS-FILE REASONING & ARCHITECTURE:
-   - For architecture, execution flow, or module interaction questions:
-     * Identify major components and explain each component's specific responsibility.
-     * Trace data flow, function calls, imports, and cross-module communication step-by-step from entry point to backend services.
-     * Explain how data transforms as it moves through the pipeline.
-     * Distinguish direct code dependencies (e.g., direct imports and function calls) from inferred architectural relationships.
-     * Do NOT simply list filenames and brief summaries; explain how they connect and collaborate.
+   - For architecture, workflow, and codebase overview questions, structure your answer using these specific sections (only include sections supported by retrieved evidence):
+     1. **Project Overview:** High-level summary of the repository's purpose and primary architecture.
+     2. **Main Components and Responsibilities:** Key modules, classes, and their individual responsibilities.
+     3. **Execution Flow:** Step-by-step control flow starting from the entry point.
+     4. **Data Flow Between Components:** Tracing how information and data structures pass and transform between components.
+     5. **External Libraries and Dependencies:** Key third-party frameworks and packages used.
+     6. **Verified Implementation Details:** Specific logic confirmed in source code with exact file and line citations.
+     7. **Documentation-Only Information:** Claims found only in README or docs that lack code backing.
+     8. **Missing or Unverified Implementation Details:** Unretrieved files, unverified modules, or implementation gaps.
+   - For other queries, separate Documented Information, Verified Implementation, and Differences/Missing Information.
+   - Trace data flow, function calls, imports, and cross-module communication step-by-step from entry point to backend services.
+   - Distinguish direct code dependencies (e.g., direct imports and function calls) from inferred architectural relationships.
+   - Do NOT simply list filenames and brief summaries; explain how they connect and collaborate.
 
 4. EXACT CITATIONS:
    - Every significant implementation claim must include the exact file path and line numbers (e.g., `backend/app/services/scanner.py:45-62` or `src/utils.js:L1-L15`).
@@ -124,6 +131,43 @@ class GeminiService:
             current_chars += len(part)
 
         context_text = "\n\n".join(context_parts)
+
+        q_lower = question.lower()
+        is_arch_query = any(
+            w in q_lower
+            for w in (
+                "architecture", "system design", "overview", "components",
+                "structure", "execution flow", "data flow", "how the project works",
+                "how it works", "end to end", "end-to-end",
+            )
+        )
+
+        arch_guidance = ""
+        if is_arch_query:
+            arch_guidance = (
+                "- For this architecture question, organize your answer using these 8 sections (only include sections supported by retrieved evidence):\n"
+                "  1. Project Overview\n"
+                "  2. Main Components and Responsibilities\n"
+                "  3. Execution Flow\n"
+                "  4. Data Flow Between Components\n"
+                "  5. External Libraries and Dependencies\n"
+                "  6. Verified Implementation Details (with exact file and line citations)\n"
+                "  7. Documentation-Only Information\n"
+                "  8. Missing or Unverified Implementation Details\n"
+            )
+
+        # Evidence coverage check: evaluate whether source code implementation files are present
+        has_source_code = any(
+            not chunk.file_path.lower().endswith((".md", ".txt", ".rst", ".json", ".yaml", ".yml", ".toml"))
+            for chunk in chunks
+        )
+        evidence_warning = ""
+        if not has_source_code and is_arch_query:
+            evidence_warning = (
+                "- IMPORTANT EVIDENCE LIMITATION: The retrieved context contains only documentation/configuration and NO concrete source-code implementation files. "
+                "State clearly in 'Missing or Unverified Implementation Details' that source-code verification is incomplete and identify which source files are missing.\n"
+            )
+
         return (
             "Here is the relevant code context retrieved from the repository:\n\n"
             f"{context_text}\n\n"
@@ -131,6 +175,8 @@ class GeminiService:
             "Instructions for your response:\n"
             "- Answer using only the code context above. Prioritize actual source-code files over documentation.\n"
             "- For every key claim, cite the relevant file path and line numbers (e.g. `path/to/file.py:10-25`).\n"
+            f"{arch_guidance}"
+            f"{evidence_warning}"
             "- Structure your answer using these sections when appropriate (omit empty or unnecessary sections):\n"
             "  * Documented Information: What the README or documentation claims.\n"
             "  * Verified Implementation: Concrete code logic confirmed in source files (Confirmed Implementation Details).\n"
@@ -143,11 +189,11 @@ class GeminiService:
         )
 
     def _generate_config(self) -> types.GenerateContentConfig:
-        """Keep answers focused to reduce unnecessary generation latency."""
+        """Keep answers focused to reduce unnecessary generation latency while supporting comprehensive architecture answers."""
         return types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
             temperature=0.2,
-            max_output_tokens=1024,
+            max_output_tokens=2048,
         )
 
     def _call_with_retry(self, prompt: str, config: types.GenerateContentConfig) -> str:

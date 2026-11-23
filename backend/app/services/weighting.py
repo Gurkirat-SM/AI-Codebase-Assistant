@@ -109,10 +109,21 @@ def detect_query_intent(query: str) -> Dict[str, float]:
     elif doc_score > 0 and doc_score >= test_score and doc_score >= config_score:
         # Architecture & design questions: prioritize actual source code for implementation proof
         # while retaining documentation for high-level structure and intent.
-        weights["code"] = 1.40
-        weights["documentation"] = 1.15
-        weights["configuration"] = 1.10
-        weights["test"] = 0.70
+        # If the user explicitly asks for source code verification, prioritize code even more heavily.
+        explicit_code_verification = any(
+            phrase in q_lower
+            for phrase in ("source code", "source-code", "in code", "verify against code", "actual code", "verify the architecture")
+        )
+        if explicit_code_verification:
+            weights["code"] = 1.60
+            weights["documentation"] = 0.95
+            weights["configuration"] = 1.10
+            weights["test"] = 0.70
+        else:
+            weights["code"] = 1.40
+            weights["documentation"] = 1.15
+            weights["configuration"] = 1.10
+            weights["test"] = 0.70
 
     elif code_score > 0:
         # Implementation questions: prioritize actual class and function definitions
@@ -139,4 +150,46 @@ def compute_file_weight(
     category = classify_file_type(file_path)
     intent_weights = detect_query_intent(query)
     return intent_weights.get(category, 1.0)
+
+
+def determine_adaptive_top_k(query: str, requested_top_k: int) -> int:
+    """Determine effective retrieval depth based on question complexity.
+    For architecture, workflow, and cross-module questions, retrieve more chunks
+    from multiple relevant files. Simple questions retain standard top_k.
+    Bounded by configurable MAX_ADAPTIVE_TOP_K.
+    """
+    settings = get_settings()
+    if not getattr(settings, "ENABLE_ADAPTIVE_RETRIEVAL", True):
+        return requested_top_k
+
+    q_lower = query.lower()
+    is_arch = any(
+        w in q_lower
+        for w in (
+            "architecture", "system design", "overview", "structure",
+            "how the project works", "how it works", "end to end",
+            "end-to-end", "components", "high level", "high-level",
+        )
+    )
+    is_flow = any(
+        w in q_lower
+        for w in (
+            "flow", "pipeline", "workflow", "lifecycle", "interaction",
+            "interact", "communicate", "between", "cross-module",
+            "data flow", "execution flow", "connect",
+        )
+    )
+
+    max_k = getattr(settings, "MAX_ADAPTIVE_TOP_K", 15)
+    arch_k = getattr(settings, "ARCHITECTURE_TOP_K", 12)
+    cross_k = getattr(settings, "CROSS_MODULE_TOP_K", 8)
+
+    if is_arch:
+        adaptive_k = max(requested_top_k, arch_k)
+    elif is_flow:
+        adaptive_k = max(requested_top_k, cross_k)
+    else:
+        adaptive_k = requested_top_k
+
+    return min(adaptive_k, max_k)
 

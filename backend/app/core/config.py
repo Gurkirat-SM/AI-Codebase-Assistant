@@ -42,6 +42,12 @@ class Settings(BaseSettings):
     DEFAULT_TOP_K: int = 5
     EMBEDDING_BATCH_SIZE: int = 32
 
+    # Adaptive Retrieval & Multi-File Architecture Depth
+    ENABLE_ADAPTIVE_RETRIEVAL: bool = True
+    MAX_ADAPTIVE_TOP_K: int = 15
+    ARCHITECTURE_TOP_K: int = 12
+    CROSS_MODULE_TOP_K: int = 8
+
     # Hybrid Search configuration
     ENABLE_HYBRID_SEARCH: bool = True
     BM25_WEIGHT: float = 0.5

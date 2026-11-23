@@ -351,3 +351,117 @@ def test_cross_file_import_co_retrieval_in_rag_service():
     assert "backend/db.py" in retrieved_paths
 
 
+# ---------------------------------------------------------------------------
+# 7. Adaptive Retrieval Depth & Multi-File Architecture Analysis
+# ---------------------------------------------------------------------------
+
+def test_adaptive_retrieval_depth():
+    """Verify that retrieval depth dynamically adapts based on query complexity."""
+    from backend.app.services.weighting import determine_adaptive_top_k
+
+    # Simple targeted question keeps default top_k
+    simple_k = determine_adaptive_top_k("how does calculate_sum format numbers", requested_top_k=5)
+    assert simple_k == 5
+
+    # Architecture query dynamically expands retrieval depth to >= 12
+    arch_k = determine_adaptive_top_k("explain the high-level system architecture and components", requested_top_k=5)
+    assert arch_k >= 12
+    assert arch_k <= 15  # Bounded by MAX_ADAPTIVE_TOP_K
+
+    # Flow / pipeline query dynamically expands depth to >= 8
+    flow_k = determine_adaptive_top_k("trace the execution flow and data flow through the pipeline", requested_top_k=5)
+    assert flow_k >= 8
+
+
+def test_architecture_8_sections_in_prompt():
+    """Verify architecture prompt contains all 8 required structured sections."""
+    service = GeminiService(api_key="mock-key")
+    chunk = make_chunk("src/app.py", 1, 25, "def create_app(): pass")
+
+    prompt = service.build_prompt("Explain the project architecture and system design", [chunk])
+    assert "1. project overview" in prompt.lower()
+    assert "2. main components and responsibilities" in prompt.lower()
+    assert "3. execution flow" in prompt.lower()
+    assert "4. data flow between components" in prompt.lower()
+    assert "5. external libraries and dependencies" in prompt.lower()
+    assert "6. verified implementation details" in prompt.lower()
+    assert "7. documentation-only information" in prompt.lower()
+    assert "8. missing or unverified implementation details" in prompt.lower()
+
+
+def test_evidence_coverage_warning_when_source_code_missing():
+    """Verify that when only documentation is retrieved for architecture questions,
+    an explicit evidence limitation warning is injected."""
+    service = GeminiService(api_key="mock-key")
+    readme_chunk = make_chunk("README.md", 1, 30, "# Project Overview\nThis app provides AI RAG search.", language="Markdown")
+
+    prompt = service.build_prompt("Explain the architecture and how it works", [readme_chunk])
+    assert "important evidence limitation" in prompt.lower()
+    assert "no concrete source-code implementation files" in prompt.lower()
+
+
+def test_source_code_verification_explicit_boost():
+    """Verify that explicit source-code verification requests strongly elevate source code over docs."""
+    q_explicit = "explain the system architecture and verify against code"
+    w_code = compute_file_weight("backend/main.py", q_explicit)
+    w_doc = compute_file_weight("README.md", q_explicit)
+
+    assert w_code >= 1.60
+    assert w_code > w_doc
+
+
+def test_multi_file_architecture_co_retrieval_in_rag_service():
+    """Verify that architecture queries adapt retrieval depth and co-retrieve entry points,
+    configuration, and core services from multiple distinct files."""
+    from backend.app.services.retriever import RagService
+
+    mock_embedder = MagicMock()
+    mock_embedder.dimension = 384
+    mock_embedder.embed_query.return_value = [0.0] * 384
+    service = RagService(embedder=mock_embedder, storage_dir="tmp_test_dir")
+    service.vector_store = MagicMock()
+    service.vector_store.total_chunks = 20
+
+    # Mock vector results returning an entry point chunk
+    main_chunk = make_chunk(
+        "backend/main.py", 1, 20,
+        "from backend.app.services.retriever import RagService\napp = create_app()\nservice = RagService()\n",
+    )
+    service.vector_store.search.return_value = [QueryResult(chunk=main_chunk, score=0.90)]
+
+    # Mock BM25 index returning service, routes, and config chunks
+    svc_chunk = make_chunk("backend/app/services/retriever.py", 1, 30, "class RagService:\n    def search(self): pass\n")
+    routes_chunk = make_chunk("backend/app/api/routes.py", 1, 25, "def query_endpoint(): pass\n")
+    config_chunk = make_chunk("backend/app/core/config.py", 1, 20, "class Settings:\n    PORT = 8000\n")
+
+    def mock_bm25_search(query, top_k, file_filter=None):
+        hits = []
+        if "RagService" in query or "service" in query:
+            hits.append((svc_chunk, 2.5))
+        if "routes" in query or "app" in query:
+            hits.append((routes_chunk, 2.3))
+        if "config" in query or "settings" in query:
+            hits.append((config_chunk, 2.0))
+        return hits
+
+    service.bm25_index = MagicMock()
+    service.bm25_index.total_chunks = 20
+    service.bm25_index.search.side_effect = mock_bm25_search
+
+    resp = service.search(
+        query="explain the system architecture, entry points, and component interactions",
+        top_k=5,
+        enable_reranker=False,
+        enable_hybrid=True,
+    )
+
+    retrieved_files = {r.chunk.file_path for r in resp.results}
+    # Multiple distinct files across layers must be represented
+    assert "backend/main.py" in retrieved_files
+    assert "backend/app/services/retriever.py" in retrieved_files
+    assert len(retrieved_files) >= 3
+    # Adaptive depth expands beyond initial top_k=5 if needed
+    assert len(resp.results) >= 3
+
+
+
