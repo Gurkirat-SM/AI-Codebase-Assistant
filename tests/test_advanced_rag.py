@@ -246,3 +246,108 @@ def test_gemini_grounding_prompt_structure():
     assert "behaviour verified by tests" in prompt.lower()
     assert "inferences" in prompt.lower()
 
+
+def test_gemini_grounding_prompt_sections_and_insufficient_context():
+    """Verify prompt instructs Gemini on explicit sections and handling insufficient context."""
+    service = GeminiService(api_key="mock-key")
+    chunk = make_chunk("src/scanner.py", 1, 30, "class RepoScanner:\n    pass")
+
+    prompt = service.build_prompt("How does repo scanning work?", [chunk])
+    assert "documented information" in prompt.lower()
+    assert "verified implementation" in prompt.lower()
+    assert "differences or missing information" in prompt.lower()
+    assert "the provided codebase context is insufficient to answer this question" in prompt.lower()
+    assert "trace data flow, function calls, and component interactions" in prompt.lower()
+
+
+def test_architecture_prioritizes_code_over_documentation():
+    """Verify architecture queries prioritize source code files for implementation proof
+    while retaining documentation for high-level structure."""
+    q = "explain the high level system architecture and component interactions"
+    w_code = compute_file_weight("src/main.py", q)
+    w_doc = compute_file_weight("README.md", q)
+    w_test = compute_file_weight("tests/test_main.py", q)
+
+    assert w_code > w_doc
+    assert w_code > w_test
+    assert w_doc > w_test
+
+
+def test_file_diversity_penalty_promotes_variety():
+    """Verify that multiple chunks from the same file experience soft decay so diverse files are not starved."""
+    # File A has 3 chunks with high initial scores
+    cA1 = make_chunk("file_a.py", 1, 10, "chunk A1", chunk_index=0)
+    cA2 = make_chunk("file_a.py", 11, 20, "chunk A2", chunk_index=1)
+    cA3 = make_chunk("file_a.py", 21, 30, "chunk A3", chunk_index=2)
+
+    # File B has 1 chunk with slightly lower initial score
+    cB1 = make_chunk("file_b.py", 1, 10, "chunk B1", chunk_index=0)
+
+    vec_results = [
+        QueryResult(chunk=cA1, score=0.90),
+        QueryResult(chunk=cA2, score=0.88),
+        QueryResult(chunk=cA3, score=0.86),
+        QueryResult(chunk=cB1, score=0.85),
+    ]
+
+    # Without diversity, file_a chunks would take top 3.
+    # With diversity factor 1.0 / (1 + 0.20 * count):
+    # cA1: count=0 -> 1.0
+    # cA2: count=1 -> 0.833
+    # cA3: count=2 -> 0.714
+    # cB1: count=0 -> 1.0
+    # Thus cB1 is promoted over cA3!
+    fused = reciprocal_rank_fusion(
+        vector_results=vec_results,
+        bm25_results=[],
+        query="query",
+        top_k=4,
+    )
+
+    fused_files = [r.chunk.file_path for r in fused]
+    # cB1 from file_b.py should rank ahead of cA3
+    assert fused_files.index("file_b.py") < fused_files.index("file_a.py", 2)
+
+
+def test_cross_file_import_co_retrieval_in_rag_service():
+    """Verify that when query asks about module interactions, imported modules are retrieved."""
+    from backend.app.services.retriever import RagService
+
+    mock_embedder = MagicMock()
+    mock_embedder.dimension = 384
+    mock_embedder.embed_query.return_value = [0.0] * 384
+    service = RagService(embedder=mock_embedder, storage_dir="tmp_test_dir")
+    service.vector_store = MagicMock()
+    service.vector_store.total_chunks = 10
+
+    # Mock vector results containing an import statement for DatabaseService
+    caller_chunk = make_chunk(
+        "backend/api.py", 1, 15,
+        "from backend.db import DatabaseService\n\ndef handle_req():\n    db = DatabaseService()\n",
+    )
+    service.vector_store.search.return_value = [QueryResult(chunk=caller_chunk, score=0.88)]
+
+    # Mock BM25 index
+    target_dep_chunk = make_chunk(
+        "backend/db.py", 1, 20,
+        "class DatabaseService:\n    def connect(self): pass\n",
+    )
+    service.bm25_index = MagicMock()
+    service.bm25_index.total_chunks = 10
+    service.bm25_index.search.side_effect = lambda query, top_k, file_filter=None: (
+        [(target_dep_chunk, 2.5)] if "DatabaseService" in query else []
+    )
+
+    # Disable reranker for deterministic unit test of retrieval step
+    resp = service.search(
+        query="how does api communicate with the database service in the pipeline",
+        top_k=5,
+        enable_reranker=False,
+        enable_hybrid=True,
+    )
+
+    retrieved_paths = [r.chunk.file_path for r in resp.results]
+    assert "backend/api.py" in retrieved_paths
+    assert "backend/db.py" in retrieved_paths
+
+

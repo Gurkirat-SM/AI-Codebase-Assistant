@@ -67,9 +67,21 @@ def reciprocal_rank_fusion(
         )
         weighted_scores[cid] = base_rrf * weight
 
-    # 4. Sort descending by final fused score
+    # 4. Sort descending by final fused score with soft file-diversity decay
+    # to avoid monopolization by multiple redundant chunks from the same file
     sorted_items = sorted(weighted_scores.items(), key=lambda x: x[1], reverse=True)
-    top_items = sorted_items[:top_k]
+    file_seen_counts: Dict[str, int] = {}
+    diversified_scores: List[Tuple[str, float]] = []
+
+    for cid, score in sorted_items:
+        fpath = chunk_map[cid].file_path
+        count = file_seen_counts.get(fpath, 0)
+        file_seen_counts[fpath] = count + 1
+        diversity_factor = 1.0 / (1.0 + 0.20 * count)
+        diversified_scores.append((cid, score * diversity_factor))
+
+    diversified_scores.sort(key=lambda x: x[1], reverse=True)
+    top_items = diversified_scores[:top_k]
 
     max_rrf = top_items[0][1] if top_items else 1.0
     fused_results: List[QueryResult] = []

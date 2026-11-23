@@ -193,9 +193,12 @@ class RagService:
 
             # Targeted retrieval: search specific code identifiers (CamelCase, snake_case)
             import re
+            q_lower = query.lower()
+            seen_bm25_ids = {c.chunk_id for c, _ in bm25_results}
+            seen_files = {r.chunk.file_path for r in vector_results} | {c.file_path for c, _ in bm25_results}
+
             identifiers = re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*[A-Z0-9_][A-Za-z0-9_]*\b", query)
             if identifiers:
-                seen_bm25_ids = {c.chunk_id for c, _ in bm25_results}
                 for ident in identifiers:
                     if len(ident) > 2 and ident.lower() not in {"the", "and", "for", "with", "from"}:
                         target_hits = self.bm25_index.search(ident, top_k=3, file_filter=file_filter)
@@ -204,22 +207,56 @@ class RagService:
                                 bm25_results.append((chunk, score))
                                 seen_bm25_ids.add(chunk.chunk_id)
 
+            # Targeted cross-file dependency & interaction retrieval:
+            # When questions ask about interactions, communication, data flow, or architecture,
+            # inspect imports in top vector results and co-retrieve the imported modules/classes.
+            is_interaction_query = any(
+                w in q_lower
+                for w in ("interact", "communicate", "flow", "call", "between", "connect", "architecture", "pipeline", "import")
+            )
+            if is_interaction_query and vector_results:
+                imported_symbols = set()
+                common_stdlib = {
+                    "os", "sys", "re", "time", "json", "typing", "logging", "pathlib", "math",
+                    "datetime", "collections", "itertools", "functools", "abc", "copy", "threading",
+                    "asyncio", "unittest", "pytest", "pydantic", "fastapi", "streamlit", "numpy",
+                }
+                for r in vector_results[:4]:
+                    matches = re.findall(
+                        r"(?:from\s+[\w.]*(\w+)\s+import\s+([A-Za-z0-9_,\s]+)|import\s+[\w.]*(\w+))",
+                        r.chunk.content,
+                    )
+                    for m in matches:
+                        mod1, symbols, mod2 = m
+                        target_mod = mod1 or mod2
+                        if target_mod and target_mod.lower() not in common_stdlib and len(target_mod) > 2:
+                            imported_symbols.add(target_mod)
+                        if symbols:
+                            for sym in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]+\b", symbols):
+                                if sym.lower() not in common_stdlib and len(sym) > 2:
+                                    imported_symbols.add(sym)
+
+                for sym in list(imported_symbols)[:5]:
+                    sym_hits = self.bm25_index.search(sym, top_k=2, file_filter=file_filter)
+                    for chunk, score in sym_hits:
+                        if chunk.chunk_id not in seen_bm25_ids:
+                            multiplier = 1.15 if chunk.file_path not in seen_files else 1.0
+                            bm25_results.append((chunk, score * multiplier))
+                            seen_bm25_ids.add(chunk.chunk_id)
+                            seen_files.add(chunk.file_path)
+
             # For architecture queries: ensure we have both high-level context (docs/config)
             # and core implementation source files to verify the architecture against code
             from backend.app.services.weighting import detect_query_intent
             intent = detect_query_intent(query)
-            if intent.get("documentation", 1.0) > 1.2:
-                has_code_file = any(
-                    not r.chunk.file_path.lower().endswith((".md", ".txt", ".rst"))
-                    for r in vector_results[:5]
-                )
-                if not has_code_file:
-                    for entry_kw in ["main", "app", "service", "pipeline"]:
-                        code_hits = self.bm25_index.search(entry_kw, top_k=2, file_filter=file_filter)
-                        for chunk, score in code_hits:
-                            if not chunk.file_path.lower().endswith((".md", ".txt", ".rst")):
+            if intent.get("documentation", 1.0) > 1.05 or "architecture" in q_lower:
+                for entry_kw in ["main", "app", "service", "routes", "pipeline"]:
+                    code_hits = self.bm25_index.search(entry_kw, top_k=2, file_filter=file_filter)
+                    for chunk, score in code_hits:
+                        if not chunk.file_path.lower().endswith((".md", ".txt", ".rst")):
+                            if chunk.chunk_id not in seen_bm25_ids:
                                 bm25_results.append((chunk, score * 1.1))
-                                break
+                                seen_bm25_ids.add(chunk.chunk_id)
 
             latencies["bm25_retrieval_sec"] = round(time.perf_counter() - t_bm25_start, 4)
 

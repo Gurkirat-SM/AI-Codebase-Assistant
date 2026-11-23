@@ -107,20 +107,20 @@ def detect_query_intent(query: str) -> Dict[str, float]:
         weights["test"] = 0.75
 
     elif doc_score > 0 and doc_score >= test_score and doc_score >= config_score:
-        # Architecture & design questions: use README/docs for high-level structure,
-        # but co-retrieve actual source files to verify the architecture against code.
-        weights["documentation"] = 1.35
-        weights["code"] = 1.25
-        weights["configuration"] = 1.15
-        weights["test"] = 0.75
+        # Architecture & design questions: prioritize actual source code for implementation proof
+        # while retaining documentation for high-level structure and intent.
+        weights["code"] = 1.40
+        weights["documentation"] = 1.15
+        weights["configuration"] = 1.10
+        weights["test"] = 0.70
 
     elif code_score > 0:
         # Implementation questions: prioritize actual class and function definitions
         # strongly over README summaries and test files.
-        weights["code"] = 1.45
-        weights["configuration"] = 0.85
-        weights["documentation"] = 0.75
-        weights["test"] = 0.70
+        weights["code"] = 1.55
+        weights["configuration"] = 0.80
+        weights["documentation"] = 0.65
+        weights["test"] = 0.65
 
     return weights
 
