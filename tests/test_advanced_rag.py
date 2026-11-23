@@ -385,8 +385,9 @@ def test_architecture_8_sections_in_prompt():
     assert "4. data flow between components" in prompt.lower()
     assert "5. external libraries and dependencies" in prompt.lower()
     assert "6. verified implementation details" in prompt.lower()
-    assert "7. documentation-only information" in prompt.lower()
-    assert "8. missing or unverified implementation details" in prompt.lower()
+    # Section 7 is now "Documentation vs. Implementation Differences"
+    assert "7. documentation vs" in prompt.lower()
+    assert "8. missing or unverified" in prompt.lower()
 
 
 def test_evidence_coverage_warning_when_source_code_missing():
@@ -462,6 +463,94 @@ def test_multi_file_architecture_co_retrieval_in_rag_service():
     assert len(retrieved_files) >= 3
     # Adaptive depth expands beyond initial top_k=5 if needed
     assert len(resp.results) >= 3
+
+
+# ---------------------------------------------------------------------------
+# 8. Documentation vs Implementation Contradiction Resolution
+# ---------------------------------------------------------------------------
+
+def test_doc_vs_code_comparison_prompt_injection():
+    """Verify that when both doc and code chunks are present for arch questions,
+    the prompt explicitly names the retrieved files and requests comparison."""
+    service = GeminiService(api_key="mock-key")
+    readme_chunk = make_chunk("README.md", 1, 20, "# Phase 1\nModel training is NOT part of Phase 1.", language="Markdown")
+    code_chunk = make_chunk("src/predictor.py", 10, 30, "class Predictor:\n    def __init__(self):\n        self.model = joblib.load('model.pkl')")
+
+    prompt = service.build_prompt("Explain the architecture and how the model is used", [readme_chunk, code_chunk])
+    # Must explicitly reference doc and code files in evidence note
+    assert "README.md" in prompt or "documentation sources" in prompt.lower()
+    assert "src/predictor.py" in prompt or "source-code sources" in prompt.lower()
+    assert "documentation vs" in prompt.lower()
+
+
+def test_doc_vs_code_contradiction_model_loading():
+    """Verify that prompt structure for model-related architecture questions includes
+    Model Integration and Inference section."""
+    service = GeminiService(api_key="mock-key")
+    code_chunk = make_chunk("src/model.py", 1, 25, "class ModelLoader:\n    def load(self):\n        return joblib.load('clf.pkl')")
+
+    prompt = service.build_prompt("Explain the architecture and model training vs inference", [code_chunk])
+    assert "model integration and inference" in prompt.lower()
+    assert "documentation vs. implementation differences" in prompt.lower()
+
+
+def test_evidence_completeness_instruction_present():
+    """Verify that build_prompt includes instruction to complete every section."""
+    service = GeminiService(api_key="mock-key")
+    chunk = make_chunk("src/app.py", 1, 10, "def main(): pass")
+    prompt = service.build_prompt("Explain the architecture", [chunk])
+    assert "complete every section" in prompt.lower()
+
+
+def test_implementation_query_code_weight_boost():
+    """Verify that explicit source-verification phrases raise code weight above 1.60 and suppress docs."""
+    # Test using an architecture-qualified query that explicitly requests source verification.
+    # "verify against source code" is an explicit_code_verification phrase and also triggers
+    # doc_score (via "architecture" in the query), giving code weight 1.70.
+    for phrase in ("verify against source code", "verify the architecture against code", "verify against code"):
+        q = f"explain the architecture and {phrase}"
+        w_code = compute_file_weight("backend/core.py", q)
+        w_doc = compute_file_weight("README.md", q)
+        assert w_code >= 1.60, f"Expected code weight >= 1.60 for query: {q!r}, got {w_code}"
+        assert w_code > w_doc, f"Code should outweigh docs for query: {q!r}"
+
+
+def test_code_coverage_enforcement_favors_source_over_doc():
+    """Verify evidence enforcement step adds source-code files when docs dominate results."""
+    from backend.app.services.retriever import RagService
+
+    mock_embedder = MagicMock()
+    mock_embedder.dimension = 384
+    mock_embedder.embed_query.return_value = [0.0] * 384
+    service = RagService(embedder=mock_embedder, storage_dir="tmp_test_dir")
+    service.vector_store = MagicMock()
+    service.vector_store.total_chunks = 10
+
+    # Vector search initially returns only README chunks
+    readme1 = make_chunk("README.md", 1, 50, "# Architecture\nThis system does X", language="Markdown")
+    readme2 = make_chunk("CONTRIBUTING.md", 1, 20, "# Contributing Guide", language="Markdown")
+    service.vector_store.search.return_value = [
+        QueryResult(chunk=readme1, score=0.90),
+        QueryResult(chunk=readme2, score=0.85),
+    ]
+
+    impl_chunk = make_chunk("backend/main.py", 1, 30, "def create_app(): app = FastAPI(); return app")
+
+    # BM25 returns a code implementation file
+    service.bm25_index = MagicMock()
+    service.bm25_index.total_chunks = 10
+    service.bm25_index.search.return_value = [(impl_chunk, 2.0)]
+
+    resp = service.search(
+        query="explain the system architecture, how it works end to end",
+        top_k=3,
+        enable_reranker=False,
+        enable_hybrid=True,
+    )
+
+    retrieved_files = {r.chunk.file_path for r in resp.results}
+    # Enforcement must have added the source-code file even though it wasn't in the top vector results
+    assert "backend/main.py" in retrieved_files
 
 
 

@@ -20,12 +20,16 @@ DOC_PATTERNS = {
     "architecture", "overview", "what is", "how to install", "readme",
     "usage", "getting started", "guide", "documentation", "explain",
     "system design", "purpose", "summary", "how does the project",
+    "explain architecture", "how does the system",
 }
 
 CODE_PATTERNS = {
     "function", "class", "method", "implement", "logic", "algorithm",
     "process", "handle", "service", "endpoint", "route", "scanner",
     "chunker", "embedder", "vector", "retriever", "query", "code",
+    # Explicit source-verification triggers always boost code
+    "verify against source", "trace execution", "explain implementation",
+    "how does it work", "source code", "source-code",
 }
 
 DOC_EXTENSIONS = {".md", ".markdown", ".rst", ".txt"}
@@ -107,30 +111,33 @@ def detect_query_intent(query: str) -> Dict[str, float]:
         weights["test"] = 0.75
 
     elif doc_score > 0 and doc_score >= test_score and doc_score >= config_score:
-        # Architecture & design questions: prioritize actual source code for implementation proof
-        # while retaining documentation for high-level structure and intent.
-        # If the user explicitly asks for source code verification, prioritize code even more heavily.
+        # Architecture & design questions: source code is primary proof; docs are supplementary.
+        # Explicit "verify against source code" triggers maximum code prioritization.
         explicit_code_verification = any(
             phrase in q_lower
-            for phrase in ("source code", "source-code", "in code", "verify against code", "actual code", "verify the architecture")
+            for phrase in (
+                "source code", "source-code", "in code", "verify against code",
+                "actual code", "verify the architecture", "verify against source",
+                "trace execution", "explain implementation", "how does it work",
+            )
         )
         if explicit_code_verification:
-            weights["code"] = 1.60
-            weights["documentation"] = 0.95
-            weights["configuration"] = 1.10
-            weights["test"] = 0.70
+            weights["code"] = 1.70
+            weights["documentation"] = 0.80
+            weights["configuration"] = 1.05
+            weights["test"] = 0.65
         else:
-            weights["code"] = 1.40
-            weights["documentation"] = 1.15
+            weights["code"] = 1.45
+            weights["documentation"] = 1.10
             weights["configuration"] = 1.10
             weights["test"] = 0.70
 
     elif code_score > 0:
-        # Implementation questions: prioritize actual class and function definitions
-        # strongly over README summaries and test files.
-        weights["code"] = 1.55
-        weights["configuration"] = 0.80
-        weights["documentation"] = 0.65
+        # Implementation questions: source code definitions are primary;
+        # strongly penalize README and test files in ranking.
+        weights["code"] = 1.60
+        weights["configuration"] = 0.75
+        weights["documentation"] = 0.60
         weights["test"] = 0.65
 
     return weights

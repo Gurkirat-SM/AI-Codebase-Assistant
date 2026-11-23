@@ -262,6 +262,15 @@ class RagService:
             )
         )
 
+        # Also detect explicit implementation / execution trace queries
+        is_impl_query = any(
+            phrase in q_lower
+            for phrase in (
+                "verify against source", "explain implementation", "trace execution",
+                "how does it work", "source code", "source-code",
+            )
+        )
+
         if use_hybrid and self.bm25_index.total_chunks > 0:
             t_bm25_start = time.perf_counter()
             bm25_results = self.bm25_index.search(
@@ -279,7 +288,7 @@ class RagService:
             if identifiers:
                 for ident in identifiers:
                     if len(ident) > 2 and ident.lower() not in {"the", "and", "for", "with", "from"}:
-                        target_hits = self.bm25_index.search(ident, top_k=3, file_filter=file_filter)
+                        target_hits = self.bm25_index.search(ident, top_k=4, file_filter=file_filter)
                         for chunk, score in target_hits:
                             if chunk.chunk_id not in seen_bm25_ids:
                                 bm25_results.append((chunk, score))
@@ -288,14 +297,15 @@ class RagService:
             # Targeted cross-file dependency & interaction retrieval:
             # When questions ask about interactions, communication, data flow, or architecture,
             # inspect imports, instantiated classes, and method calls in top candidate chunks.
-            if (is_interaction_query or is_arch_query) and vector_results:
+            common_stdlib = {
+                "os", "sys", "re", "time", "json", "typing", "logging", "pathlib", "math",
+                "datetime", "collections", "itertools", "functools", "abc", "copy", "threading",
+                "asyncio", "unittest", "pytest", "pydantic", "fastapi", "streamlit", "numpy",
+                "torch", "tensorflow", "sklearn", "pandas", "requests", "httpx", "sqlalchemy",
+            }
+            if (is_interaction_query or is_arch_query or is_impl_query) and vector_results:
                 imported_symbols = set()
-                common_stdlib = {
-                    "os", "sys", "re", "time", "json", "typing", "logging", "pathlib", "math",
-                    "datetime", "collections", "itertools", "functools", "abc", "copy", "threading",
-                    "asyncio", "unittest", "pytest", "pydantic", "fastapi", "streamlit", "numpy",
-                }
-                for r in vector_results[:6]:
+                for r in vector_results[:8]:
                     matches = re.findall(
                         r"(?:from\s+[\w.]*(\w+)\s+import\s+([A-Za-z0-9_,\s]+)|import\s+[\w.]*(\w+))",
                         r.chunk.content,
@@ -315,34 +325,52 @@ class RagService:
                         if call_m not in common_stdlib and len(call_m) > 2:
                             imported_symbols.add(call_m)
 
-                for sym in list(imported_symbols)[:8]:
-                    sym_hits = self.bm25_index.search(sym, top_k=2, file_filter=file_filter)
+                for sym in list(imported_symbols)[:10]:
+                    sym_hits = self.bm25_index.search(sym, top_k=3, file_filter=file_filter)
                     for chunk, score in sym_hits:
                         if chunk.chunk_id not in seen_bm25_ids:
-                            multiplier = 1.15 if chunk.file_path not in seen_files else 1.0
+                            # Extra boost for newly discovered files (cross-file diversity)
+                            multiplier = 1.20 if chunk.file_path not in seen_files else 1.0
                             bm25_results.append((chunk, score * multiplier))
                             seen_bm25_ids.add(chunk.chunk_id)
                             seen_files.add(chunk.file_path)
 
-            # For architecture queries: ensure we have entry points, core service definitions,
-            # and key configuration files to support full multi-file codebase analysis
-            if is_arch_query or intent.get("documentation", 1.0) > 1.05:
-                # 1. Main entry points
-                for entry_kw in ["main", "app", "routes", "server", "index", "cli", "streamlit_app"]:
+            # For architecture and implementation-verification queries:
+            # Ensure we co-retrieve entry points, core service definitions, and configuration
+            if is_arch_query or is_impl_query or intent.get("documentation", 1.0) > 1.05:
+                # 1. Main entry points with implementation priority (exclude docs)
+                for entry_kw in ["main", "app", "routes", "server", "index", "cli", "streamlit_app", "train", "predict", "inference"]:
                     code_hits = self.bm25_index.search(entry_kw, top_k=2, file_filter=file_filter)
                     for chunk, score in code_hits:
                         if not chunk.file_path.lower().endswith((".md", ".txt", ".rst")):
                             if chunk.chunk_id not in seen_bm25_ids:
-                                bm25_results.append((chunk, score * 1.1))
+                                bm25_results.append((chunk, score * 1.15))
                                 seen_bm25_ids.add(chunk.chunk_id)
 
-                # 2. Key configuration files
+                # 2. Key configuration and project structure files
                 for config_kw in ["settings", "config", "requirements", "docker"]:
                     config_hits = self.bm25_index.search(config_kw, top_k=2, file_filter=file_filter)
                     for chunk, score in config_hits:
                         if chunk.chunk_id not in seen_bm25_ids:
                             bm25_results.append((chunk, score * 1.05))
                             seen_bm25_ids.add(chunk.chunk_id)
+
+                # 3. For each doc-based chunk already in results, search for the implementation
+                # counterpart to enable side-by-side comparison (doc vs. code)
+                doc_topics: Set[str] = set()
+                for r in vector_results[:4]:
+                    if r.chunk.file_path.lower().endswith((".md", ".txt", ".rst")):
+                        # Extract meaningful noun phrases: 2+ word title tokens, class names
+                        for topic in re.findall(r"\b([A-Z][a-z]+(?:[A-Z][a-z]*)*|[a-z]+_[a-z_]+)\b", r.chunk.content):
+                            if len(topic) > 4 and topic.lower() not in common_stdlib:
+                                doc_topics.add(topic)
+                for topic in list(doc_topics)[:5]:
+                    impl_hits = self.bm25_index.search(topic, top_k=2, file_filter=file_filter)
+                    for chunk, score in impl_hits:
+                        if not chunk.file_path.lower().endswith((".md", ".txt", ".rst")):
+                            if chunk.chunk_id not in seen_bm25_ids:
+                                bm25_results.append((chunk, score * 1.10))
+                                seen_bm25_ids.add(chunk.chunk_id)
 
             latencies["bm25_retrieval_sec"] = round(time.perf_counter() - t_bm25_start, 4)
 
@@ -372,17 +400,41 @@ class RagService:
         latencies["reranking_sec"] = round(time.perf_counter() - t_rerank_start, 4)
 
         # 5. Evidence Coverage & Multi-File Diversity Enforcement
-        # For architecture and cross-module queries, ensure evidence covers multiple files
-        if (is_arch_query or is_interaction_query) and len(candidates) > len(final_results):
+        # For architecture and cross-module queries, ensure evidence covers multiple distinct files.
+        # Also enforce: for impl_query, prefer code files over docs if docs are dominating.
+        if (is_arch_query or is_interaction_query or is_impl_query) and len(candidates) > len(final_results):
             distinct_files = {r.chunk.file_path for r in final_results}
-            if len(distinct_files) < 3:
+            # Count source-code files in final results (non-doc/config)
+            code_file_count = sum(
+                1 for r in final_results
+                if not r.chunk.file_path.lower().endswith((".md", ".txt", ".rst", ".yaml", ".yml", ".toml", ".json"))
+            )
+            # Minimum 3 distinct files, at least 2 of which must be source-code files
+            min_files_needed = 3
+            min_code_files_needed = 2
+            while (
+                len(candidates) > 0
+                and (len(distinct_files) < min_files_needed or code_file_count < min_code_files_needed)
+                and len(final_results) < effective_top_k + 4
+            ):
+                added = False
                 for cand in candidates:
                     if cand.chunk.file_path not in distinct_files:
+                        is_code = not cand.chunk.file_path.lower().endswith(
+                            (".md", ".txt", ".rst", ".yaml", ".yml", ".toml", ".json")
+                        )
+                        # Prefer code files when we're short on code coverage
+                        if code_file_count < min_code_files_needed and not is_code:
+                            continue
                         final_results.append(cand)
                         distinct_files.add(cand.chunk.file_path)
-                        if len(distinct_files) >= 4 or len(final_results) >= effective_top_k + 3:
-                            break
-        latencies["reranking_sec"] = round(time.perf_counter() - t_rerank_start, 4)
+                        if is_code:
+                            code_file_count += 1
+                        added = True
+                        break
+                if not added:
+                    break  # No more candidates to add
+        latencies["coverage_enforcement_sec"] = round(time.perf_counter() - t_rerank_start, 4)
 
         latencies["total_retrieval_sec"] = round(time.perf_counter() - t_total_start, 4)
 
