@@ -93,28 +93,34 @@ def detect_query_intent(query: str) -> Dict[str, float]:
     }
 
     if test_score > 0 and test_score >= config_score and test_score >= doc_score:
-        weights["test"] = 1.35
+        # Testing questions: prioritize test suites and verification specs
+        weights["test"] = 1.45
         weights["code"] = 1.05
-        weights["configuration"] = 0.90
-        weights["documentation"] = 0.85
+        weights["configuration"] = 0.85
+        weights["documentation"] = 0.75
 
     elif config_score > 0 and config_score >= test_score and config_score >= doc_score:
+        # Configuration questions: prioritize configs and setup guides
         weights["configuration"] = 1.40
-        weights["documentation"] = 1.10
+        weights["documentation"] = 1.15
         weights["code"] = 0.95
-        weights["test"] = 0.80
+        weights["test"] = 0.75
 
     elif doc_score > 0 and doc_score >= test_score and doc_score >= config_score:
-        weights["documentation"] = 1.40
-        weights["code"] = 1.05
-        weights["configuration"] = 1.00
-        weights["test"] = 0.80
+        # Architecture & design questions: use README/docs for high-level structure,
+        # but co-retrieve actual source files to verify the architecture against code.
+        weights["documentation"] = 1.35
+        weights["code"] = 1.25
+        weights["configuration"] = 1.15
+        weights["test"] = 0.75
 
     elif code_score > 0:
-        weights["code"] = 1.25
-        weights["configuration"] = 0.90
-        weights["documentation"] = 0.85
-        weights["test"] = 0.80
+        # Implementation questions: prioritize actual class and function definitions
+        # strongly over README summaries and test files.
+        weights["code"] = 1.45
+        weights["configuration"] = 0.85
+        weights["documentation"] = 0.75
+        weights["test"] = 0.70
 
     return weights
 

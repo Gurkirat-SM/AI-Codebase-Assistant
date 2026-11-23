@@ -217,3 +217,32 @@ def test_gemini_insufficient_context_response():
     answer = service.generate_answer("How does authentication work?", [])
     assert "No relevant code context was found" in answer
     mock_client.models.generate_content.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 6. Implementation Prioritization & Grounding Prompt
+# ---------------------------------------------------------------------------
+
+def test_implementation_query_prioritizes_code_over_docs_and_tests():
+    """Verify implementation questions strongly favor actual source code over README and test files."""
+    q = "how does the function calculate and process chunk boundaries"
+    w_code = compute_file_weight("src/chunker.py", q)
+    w_doc = compute_file_weight("README.md", q)
+    w_test = compute_file_weight("tests/test_chunker.py", q)
+
+    assert w_code > w_doc
+    assert w_code > w_test
+    assert w_code >= 1.40
+
+
+def test_gemini_grounding_prompt_structure():
+    """Verify prompt instructs Gemini to distinguish confirmed details, tests, and inferences."""
+    service = GeminiService(api_key="mock-key")
+    chunk = make_chunk("src/auth.py", 10, 20, "def authenticate(): pass")
+
+    prompt = service.build_prompt("Explain auth", [chunk])
+    assert "cite the relevant file path and line numbers" in prompt.lower()
+    assert "confirmed implementation details" in prompt.lower()
+    assert "behaviour verified by tests" in prompt.lower()
+    assert "inferences" in prompt.lower()
+

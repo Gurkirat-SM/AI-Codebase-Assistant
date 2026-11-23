@@ -40,6 +40,7 @@ class RagService:
         self.vector_store = vector_store
         self.bm25_index = bm25_index if bm25_index is not None else BM25Index()
         self.reranker = reranker if reranker is not None else get_reranker()
+        self.last_scan_summary = None
 
         # Attempt to auto-load persisted indexes if vector store not pre-provided
         if self.vector_store is None:
@@ -81,6 +82,7 @@ class RagService:
             additional_exclusions=additional_exclusions or [],
         )
         scan_summary = scanner.scan()
+        self.last_scan_summary = scan_summary
 
         # 2. Chunk discovered files using code-aware chunker
         chunker = CodeChunker(
@@ -179,7 +181,7 @@ class RagService:
         )
         latencies["vector_retrieval_sec"] = round(time.perf_counter() - t_vec_start, 4)
 
-        # 2. BM25 Keyword Search
+        # 2. BM25 Keyword Search & Targeted Symbol Retrieval
         bm25_results = []
         if use_hybrid and self.bm25_index.total_chunks > 0:
             t_bm25_start = time.perf_counter()
@@ -188,6 +190,37 @@ class RagService:
                 top_k=candidate_k,
                 file_filter=file_filter,
             )
+
+            # Targeted retrieval: search specific code identifiers (CamelCase, snake_case)
+            import re
+            identifiers = re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*[A-Z0-9_][A-Za-z0-9_]*\b", query)
+            if identifiers:
+                seen_bm25_ids = {c.chunk_id for c, _ in bm25_results}
+                for ident in identifiers:
+                    if len(ident) > 2 and ident.lower() not in {"the", "and", "for", "with", "from"}:
+                        target_hits = self.bm25_index.search(ident, top_k=3, file_filter=file_filter)
+                        for chunk, score in target_hits:
+                            if chunk.chunk_id not in seen_bm25_ids:
+                                bm25_results.append((chunk, score))
+                                seen_bm25_ids.add(chunk.chunk_id)
+
+            # For architecture queries: ensure we have both high-level context (docs/config)
+            # and core implementation source files to verify the architecture against code
+            from backend.app.services.weighting import detect_query_intent
+            intent = detect_query_intent(query)
+            if intent.get("documentation", 1.0) > 1.2:
+                has_code_file = any(
+                    not r.chunk.file_path.lower().endswith((".md", ".txt", ".rst"))
+                    for r in vector_results[:5]
+                )
+                if not has_code_file:
+                    for entry_kw in ["main", "app", "service", "pipeline"]:
+                        code_hits = self.bm25_index.search(entry_kw, top_k=2, file_filter=file_filter)
+                        for chunk, score in code_hits:
+                            if not chunk.file_path.lower().endswith((".md", ".txt", ".rst")):
+                                bm25_results.append((chunk, score * 1.1))
+                                break
+
             latencies["bm25_retrieval_sec"] = round(time.perf_counter() - t_bm25_start, 4)
 
         # 3. Hybrid Fusion via Reciprocal Rank Fusion (RRF) with file-type weighting
