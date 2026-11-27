@@ -552,5 +552,173 @@ def test_code_coverage_enforcement_favors_source_over_doc():
     # Enforcement must have added the source-code file even though it wasn't in the top vector results
     assert "backend/main.py" in retrieved_files
 
+# ---------------------------------------------------------------------------
+# 9. Performance Optimization & Execution-Flow Tests
+# ---------------------------------------------------------------------------
 
+def test_execution_flow_query_adaptive_top_k():
+    """Verify that execution-flow queries expand adaptive top_k beyond the user's request."""
+    from backend.app.services.weighting import determine_adaptive_top_k
+    # "trace execution flow" contains "execution flow" → is_flow trigger
+    result = determine_adaptive_top_k("trace execution flow from webcam capture to gesture prediction", 5)
+    assert result >= 8, f"Expected >= 8 for flow query, got {result}"
+
+
+def test_ml_model_query_detection_in_llm():
+    """Verify is_model_query now catches gesture/webcam/landmark terms for ML flow questions."""
+    service = GeminiService(api_key="mock-key")
+    code_chunk = make_chunk(
+        "src/predictor.py", 1, 20,
+        "class GesturePredictor:\n    def predict(self, landmarks):\n        return self.clf.predict([landmarks])",
+    )
+    # Prompt for a gesture/webcam question should include model-inference section in arch context
+    prompt = service.build_prompt(
+        "Explain the architecture and how the gesture prediction pipeline works end to end", [code_chunk]
+    )
+    # is_arch_query=True (architecture, end to end), is_model_query=True (gesture/predict)
+    # → prompt must contain "model integration and inference"
+    assert "model integration and inference" in prompt.lower()
+
+
+def test_flow_query_stage_verification_instruction():
+    """Verify that execution-flow questions inject the staged-verification instruction."""
+    service = GeminiService(api_key="mock-key")
+    chunk = make_chunk("src/app.py", 1, 10, "import cv2\ncap = cv2.VideoCapture(0)")
+    prompt = service.build_prompt(
+        "Trace execution from webcam capture through gesture prediction to output", [chunk]
+    )
+    # Must contain the stage-verification language
+    assert "not verified" in prompt.lower() or "stage n" in prompt.lower() or "stage" in prompt.lower()
+    assert "webcam" in prompt.lower() or "ml" in prompt.lower() or "pipeline" in prompt.lower()
+
+
+def test_flow_guidance_absent_for_non_flow_query():
+    """Verify that the staged-verification instruction is NOT injected for plain code questions."""
+    service = GeminiService(api_key="mock-key")
+    chunk = make_chunk("src/scanner.py", 1, 5, "def scan(): pass")
+    prompt = service.build_prompt("What does the scanner do?", [chunk])
+    # Should not contain the ML-flow-specific instruction for simple queries
+    assert "stage n [name]: not verified" not in prompt.lower()
+
+
+def test_reranker_candidate_cap_applied(monkeypatch):
+    """Verify that reranker receives at most RERANKER_MAX_CANDIDATES items even with many candidates."""
+    from backend.app.services.retriever import RagService
+    from backend.app.core.config import get_settings
+
+    mock_embedder = MagicMock()
+    mock_embedder.dimension = 384
+    mock_embedder.embed_query.return_value = [0.0] * 384
+
+    service = RagService(embedder=mock_embedder, storage_dir="tmp_test_cap")
+    service.vector_store = MagicMock()
+    service.vector_store.total_chunks = 50
+
+    # Return 50 unique vector results to trigger the cap
+    many_chunks = [
+        make_chunk(f"src/file_{i}.py", i + 1, i + 6, f"def func_{i}(): pass")
+        for i in range(50)
+    ]
+    service.vector_store.search.return_value = [
+        QueryResult(chunk=c, score=round(0.9 - i * 0.01, 2))
+        for i, c in enumerate(many_chunks)
+    ]
+    service.bm25_index = MagicMock()
+    service.bm25_index.total_chunks = 0  # disable hybrid to isolate cap logic
+
+    # Capture the candidates passed to reranker
+    received_candidates = []
+
+    class CapturingReranker:
+        is_available = True
+
+        def rerank(self, query, candidates, top_k):
+            received_candidates.extend(candidates)
+            return candidates[:top_k]
+
+    service.reranker = CapturingReranker()
+
+    service.search(
+        query="what is the architecture of this system",
+        top_k=5,
+        enable_reranker=True,
+        enable_hybrid=False,
+    )
+    settings = get_settings()
+    max_candidates = getattr(settings, "RERANKER_MAX_CANDIDATES", 25)
+    assert len(received_candidates) <= max_candidates, (
+        f"Expected <= {max_candidates} candidates, reranker got {len(received_candidates)}"
+    )
+
+
+def test_entry_point_cache_populated_after_index():
+    """Verify that _entry_point_cache is populated after index_repository()."""
+    from backend.app.services.retriever import RagService
+    from backend.app.services.bm25 import BM25Index
+
+    mock_embedder = MagicMock()
+    mock_embedder.dimension = 384
+    mock_embedder.embed_chunks.return_value = [[0.0] * 384]
+    mock_embedder.model_name = "mock-model"
+
+    bm25 = BM25Index()
+    main_chunk = make_chunk("backend/main.py", 1, 10, "def main(): app = create_app()")
+    bm25.add_chunks([main_chunk])
+
+    service = RagService(embedder=mock_embedder, bm25_index=bm25, storage_dir="tmp_cache_test")
+    service.vector_store = MagicMock()
+    service.vector_store.total_chunks = 1
+
+    # Manually call cache builder (normally called in index_repository)
+    service._build_entry_point_cache()
+
+    # Cache should be non-empty
+    assert isinstance(service._entry_point_cache, dict)
+    # "main" is an entry keyword; since bm25 has a main.py chunk it should populate
+    assert len(service._entry_point_cache) > 0
+
+
+def test_num_reranker_candidates_in_latencies(monkeypatch):
+    """Verify that latencies dict includes num_reranker_candidates key."""
+    from backend.app.services.retriever import RagService
+
+    mock_embedder = MagicMock()
+    mock_embedder.dimension = 384
+    mock_embedder.embed_query.return_value = [0.0] * 384
+
+    service = RagService(embedder=mock_embedder, storage_dir="tmp_latency_test")
+    service.vector_store = MagicMock()
+    service.vector_store.total_chunks = 5
+
+    chunks = [make_chunk(f"src/f{i}.py", 1, 5, f"class C{i}: pass") for i in range(5)]
+    service.vector_store.search.return_value = [QueryResult(chunk=c, score=0.8) for c in chunks]
+    service.bm25_index = MagicMock()
+    service.bm25_index.total_chunks = 0
+
+    mock_reranker = MagicMock()
+    mock_reranker.is_available = True
+    mock_reranker.rerank.return_value = [QueryResult(chunk=chunks[0], score=0.9)]
+    service.reranker = mock_reranker
+
+    resp = service.search(
+        query="how does the system work",
+        top_k=3,
+        enable_reranker=True,
+        enable_hybrid=False,
+    )
+    assert "num_reranker_candidates" in resp.latencies
+    assert isinstance(resp.latencies["num_reranker_candidates"], (int, float))
+    assert resp.latencies["num_reranker_candidates"] == 5
+
+
+def test_incomplete_flow_evidence_instruction_contains_verified():
+    """Verify build_prompt for execution-flow question instructs to report unverified stages."""
+    service = GeminiService(api_key="mock-key")
+    chunk = make_chunk("src/predictor.py", 1, 15, "class GesturePredictor:\n    def predict(self, lm): pass")
+    prompt = service.build_prompt(
+        "Trace the execution from webcam input through landmark extraction to gesture prediction", [chunk]
+    )
+    # Key phrases from flow_guidance must be present
+    assert "not verified" in prompt.lower()
+    assert "cite" in prompt.lower() or "line numbers" in prompt.lower()
 

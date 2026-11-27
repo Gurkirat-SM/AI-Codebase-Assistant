@@ -42,6 +42,7 @@ class RagService:
         self.reranker = reranker if reranker is not None else get_reranker()
         self.last_scan_summary = None
         self._dependency_cache: Dict[str, Dict[str, Any]] = {}
+        self._entry_point_cache: Dict[str, List[CodeChunk]] = {}
 
         # Attempt to auto-load persisted indexes if vector store not pre-provided
         if self.vector_store is None:
@@ -99,6 +100,21 @@ class RagService:
             if hasattr(self.bm25_index, "chunks") and self.bm25_index.chunks:
                 self._dependency_cache = self._extract_file_dependencies(self.bm25_index.chunks)
         return self._dependency_cache
+
+    def _build_entry_point_cache(self) -> None:
+        """Pre-compute BM25 results for entry-point and config keywords at index time.
+        Called once during index_repository() to avoid repeated BM25 lookups per query.
+        """
+        self._entry_point_cache: Dict[str, List[CodeChunk]] = {}
+        entry_kws = [
+            "main", "app", "routes", "server", "index", "cli", "streamlit_app",
+            "train", "predict", "inference",
+        ]
+        config_kws = ["settings", "config", "requirements", "docker"]
+        for kw in entry_kws + config_kws:
+            hits = self.bm25_index.search(kw, top_k=2)
+            if hits:
+                self._entry_point_cache[kw] = [chunk for chunk, _ in hits]
 
     def _init_vector_store(self):
         """Initialize FAISS vector store and BM25 index, loading from disk if present."""
@@ -184,6 +200,9 @@ class RagService:
         # 5b. Cache dependency and module relationship graph
         self._dependency_cache = self._extract_file_dependencies(all_chunks)
 
+        # 5c. Pre-compute entry-point cache to eliminate per-query BM25 lookups
+        self._build_entry_point_cache()
+
         # 6. Optionally persist to disk
         persisted_path = None
         if persist:
@@ -228,6 +247,8 @@ class RagService:
 
         effective_top_k = determine_adaptive_top_k(query, top_k)
         candidate_k = max(effective_top_k * 4, settings.RERANKER_TOP_N_CANDIDATES)
+        # Hard cap on candidates sent to cross-encoder to control O(n) inference cost
+        reranker_max = getattr(settings, "RERANKER_MAX_CANDIDATES", 25)
 
         # 1. Vector Search
         t_vec_start = time.perf_counter()
@@ -271,6 +292,17 @@ class RagService:
             )
         )
 
+        # Detect end-to-end execution-flow questions (webcam, pipeline, gesture, etc.)
+        is_flow_query = any(
+            phrase in q_lower
+            for phrase in (
+                "execution flow", "trace execution", "end to end", "end-to-end",
+                "webcam", "frame capture", "frame loop", "pipeline", "gesture",
+                "recognize", "classify", "detect hand", "landmark", "feature",
+                "normalize", "confidence threshold", "label", "predict",
+            )
+        )
+
         if use_hybrid and self.bm25_index.total_chunks > 0:
             t_bm25_start = time.perf_counter()
             bm25_results = self.bm25_index.search(
@@ -303,7 +335,7 @@ class RagService:
                 "asyncio", "unittest", "pytest", "pydantic", "fastapi", "streamlit", "numpy",
                 "torch", "tensorflow", "sklearn", "pandas", "requests", "httpx", "sqlalchemy",
             }
-            if (is_interaction_query or is_arch_query or is_impl_query) and vector_results:
+            if (is_interaction_query or is_arch_query or is_impl_query or is_flow_query) and vector_results:
                 imported_symbols = set()
                 for r in vector_results[:8]:
                     matches = re.findall(
@@ -325,7 +357,23 @@ class RagService:
                         if call_m not in common_stdlib and len(call_m) > 2:
                             imported_symbols.add(call_m)
 
+                # For each symbol, check the dependency cache first to avoid unnecessary BM25 calls
+                dep_graph = self._get_dependency_graph()
+                symbols_to_search = []
                 for sym in list(imported_symbols)[:10]:
+                    # Look up in cached dependency graph — if we know which file defines/imports it, skip BM25
+                    cache_hit = False
+                    for fpath, fdeps in dep_graph.items():
+                        if sym in fdeps.get("classes", set()) or sym in fdeps.get("functions", set()):
+                            # Find chunks from that file already in seen sets — if already retrieved, skip search
+                            if fpath not in seen_files:
+                                symbols_to_search.append(sym)
+                            cache_hit = True
+                            break
+                    if not cache_hit:
+                        symbols_to_search.append(sym)
+
+                for sym in symbols_to_search[:8]:
                     sym_hits = self.bm25_index.search(sym, top_k=3, file_filter=file_filter)
                     for chunk, score in sym_hits:
                         if chunk.chunk_id not in seen_bm25_ids:
@@ -336,24 +384,43 @@ class RagService:
                             seen_files.add(chunk.file_path)
 
             # For architecture and implementation-verification queries:
-            # Ensure we co-retrieve entry points, core service definitions, and configuration
-            if is_arch_query or is_impl_query or intent.get("documentation", 1.0) > 1.05:
-                # 1. Main entry points with implementation priority (exclude docs)
-                for entry_kw in ["main", "app", "routes", "server", "index", "cli", "streamlit_app", "train", "predict", "inference"]:
-                    code_hits = self.bm25_index.search(entry_kw, top_k=2, file_filter=file_filter)
-                    for chunk, score in code_hits:
-                        if not chunk.file_path.lower().endswith((".md", ".txt", ".rst")):
+            # Use pre-built entry-point cache (populated at index time) to avoid repeated BM25 lookups.
+            if is_arch_query or is_impl_query or is_flow_query or intent.get("documentation", 1.0) > 1.05:
+                entry_kws = [
+                    "main", "app", "routes", "server", "index", "cli", "streamlit_app",
+                    "train", "predict", "inference",
+                ]
+                config_kws = ["settings", "config", "requirements", "docker"]
+                # Use cached lookups when available; fall back to live BM25 only if cache is empty
+                has_cache = bool(getattr(self, "_entry_point_cache", None))
+                for kw in entry_kws:
+                    if has_cache:
+                        cached_chunks = self._entry_point_cache.get(kw, [])
+                        for chunk in cached_chunks:
+                            if not chunk.file_path.lower().endswith((".md", ".txt", ".rst")):
+                                if chunk.chunk_id not in seen_bm25_ids:
+                                    bm25_results.append((chunk, 1.0 * 1.15))
+                                    seen_bm25_ids.add(chunk.chunk_id)
+                    else:
+                        code_hits = self.bm25_index.search(kw, top_k=2, file_filter=file_filter)
+                        for chunk, score in code_hits:
+                            if not chunk.file_path.lower().endswith((".md", ".txt", ".rst")):
+                                if chunk.chunk_id not in seen_bm25_ids:
+                                    bm25_results.append((chunk, score * 1.15))
+                                    seen_bm25_ids.add(chunk.chunk_id)
+                for kw in config_kws:
+                    if has_cache:
+                        cached_chunks = self._entry_point_cache.get(kw, [])
+                        for chunk in cached_chunks:
                             if chunk.chunk_id not in seen_bm25_ids:
-                                bm25_results.append((chunk, score * 1.15))
+                                bm25_results.append((chunk, 1.0 * 1.05))
                                 seen_bm25_ids.add(chunk.chunk_id)
-
-                # 2. Key configuration and project structure files
-                for config_kw in ["settings", "config", "requirements", "docker"]:
-                    config_hits = self.bm25_index.search(config_kw, top_k=2, file_filter=file_filter)
-                    for chunk, score in config_hits:
-                        if chunk.chunk_id not in seen_bm25_ids:
-                            bm25_results.append((chunk, score * 1.05))
-                            seen_bm25_ids.add(chunk.chunk_id)
+                    else:
+                        config_hits = self.bm25_index.search(kw, top_k=2, file_filter=file_filter)
+                        for chunk, score in config_hits:
+                            if chunk.chunk_id not in seen_bm25_ids:
+                                bm25_results.append((chunk, score * 1.05))
+                                seen_bm25_ids.add(chunk.chunk_id)
 
                 # 3. For each doc-based chunk already in results, search for the implementation
                 # counterpart to enable side-by-side comparison (doc vs. code)
@@ -390,19 +457,31 @@ class RagService:
         # 4. Cross-Encoder Reranking
         t_rerank_start = time.perf_counter()
         if use_reranker and self.reranker.is_available:
+            # Cap candidates sent to cross-encoder to control O(n) inference cost.
+            # Apply RRF-score-based pre-filter: drop candidates below 10% of max RRF score.
+            rerank_input = candidates
+            if len(rerank_input) > reranker_max:
+                if rerank_input:
+                    max_score = max(r.score for r in rerank_input) or 1.0
+                    threshold = max_score * 0.10
+                    filtered = [r for r in rerank_input if r.score >= threshold]
+                    rerank_input = filtered[:reranker_max] if filtered else rerank_input[:reranker_max]
+            latencies["num_reranker_candidates"] = len(rerank_input)
             final_results = self.reranker.rerank(
                 query=query,
-                candidates=candidates,
+                candidates=rerank_input,
                 top_k=effective_top_k,
             )
         else:
+            latencies["num_reranker_candidates"] = 0
             final_results = candidates[:effective_top_k]
         latencies["reranking_sec"] = round(time.perf_counter() - t_rerank_start, 4)
 
         # 5. Evidence Coverage & Multi-File Diversity Enforcement
         # For architecture and cross-module queries, ensure evidence covers multiple distinct files.
-        # Also enforce: for impl_query, prefer code files over docs if docs are dominating.
-        if (is_arch_query or is_interaction_query or is_impl_query) and len(candidates) > len(final_results):
+        # Also enforce: for impl_query/flow_query, prefer code files over docs if docs are dominating.
+        t_coverage_start = time.perf_counter()
+        if (is_arch_query or is_interaction_query or is_impl_query or is_flow_query) and len(candidates) > len(final_results):
             distinct_files = {r.chunk.file_path for r in final_results}
             # Count source-code files in final results (non-doc/config)
             code_file_count = sum(
@@ -434,7 +513,7 @@ class RagService:
                         break
                 if not added:
                     break  # No more candidates to add
-        latencies["coverage_enforcement_sec"] = round(time.perf_counter() - t_rerank_start, 4)
+        latencies["coverage_enforcement_sec"] = round(time.perf_counter() - t_coverage_start, 4)
 
         latencies["total_retrieval_sec"] = round(time.perf_counter() - t_total_start, 4)
 

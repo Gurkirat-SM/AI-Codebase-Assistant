@@ -61,6 +61,8 @@ class Settings(BaseSettings):
     ENABLE_RERANKER: bool = True
     RERANKER_MODEL_NAME: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     RERANKER_TOP_N_CANDIDATES: int = 20
+    # Hard cap on candidates sent to cross-encoder (limits O(n) inference cost)
+    RERANKER_MAX_CANDIDATES: int = 25
 
     # Generation & Context Budget
     MAX_CONTEXT_CHARS: int = 24_000

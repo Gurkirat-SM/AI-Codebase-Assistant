@@ -148,7 +148,16 @@ class GeminiService:
         )
         is_model_query = any(
             w in q_lower
-            for w in ("model", "training", "inference", "train", "predict", "classifier", "predictor", "load model")
+            for w in ("model", "training", "inference", "train", "predict", "classifier", "predictor", "load model",
+                      "gesture", "recognize", "classify", "webcam", "frame", "landmark")
+        )
+        is_flow_query = any(
+            phrase in q_lower
+            for phrase in (
+                "execution flow", "trace execution", "end to end", "end-to-end",
+                "webcam", "frame capture", "frame loop", "pipeline", "gesture",
+                "recognize", "classify", "landmark", "confidence threshold",
+            )
         )
 
         arch_guidance = ""
@@ -181,6 +190,20 @@ class GeminiService:
                 "against retrieved source code. E.g., if the README says model training is not in Phase 1 "
                 "but a predictor loads a trained model, state: loading a pre-trained model is verified, "
                 "but no training code was retrieved — do not conflate loading with training.\n"
+            )
+
+        # For execution-flow questions: require staged, ordered, evidence-verified tracing
+        flow_guidance = ""
+        if is_flow_query:
+            flow_guidance = (
+                "- For this execution-flow question, verify each stage in the pipeline in order using "
+                "the retrieved source code. For every stage, cite the exact file and line numbers.\n"
+                "- If a stage cannot be found in the retrieved source code, explicitly state: "
+                "'Stage N [name]: NOT VERIFIED — [ClassName.method_name] was not retrieved.' "
+                "Do not describe inferred or assumed behaviour as confirmed implementation.\n"
+                "- For ML/gesture/prediction pipelines, specifically look for and verify: "
+                "webcam/camera init, frame capture loop, preprocessing, model loading, "
+                "predict() call, label decoding, confidence threshold, and result display.\n"
             )
 
         # Evidence coverage check: evaluate whether source code implementation files are present
@@ -219,6 +242,7 @@ class GeminiService:
             "- Answer using only the code context above. Prioritize actual source-code files over documentation.\n"
             "- For every key claim, cite the relevant file path and line numbers (e.g. `path/to/file.py:10-25`).\n"
             f"{arch_guidance}"
+            f"{flow_guidance}"
             f"{evidence_warning}"
             "- Structure your answer using these sections when appropriate (omit empty or unnecessary sections):\n"
             "  * Documented Information: What the README or documentation claims.\n"
